@@ -185,7 +185,8 @@ def prominient_features(barcodes):
 def entropy_loss(points: torch.TensorType, max_dim: int = 2, use_prominient_features=True, use_in_cluster_l2=True, l2_lambda = 0.5):
 
     # the second retured value can be ignored if number of features is not logged
-    
+    assert points.ndim == 2, "Points must be reshaped to a 2-dimensional tensor before proceeding"
+
     # default value
     ent = 0
     prom_feats = 0
@@ -201,8 +202,7 @@ def entropy_loss(points: torch.TensorType, max_dim: int = 2, use_prominient_feat
         prom_feats += prom_feats_ind
     else:
         prom_feats += lens.shape[0]
-    # ent0 = barcode_entropy(lens)
-    ent0 = 0
+    ent0 = barcode_entropy(lens)
     if (use_in_cluster_l2 and use_prominient_features):
         ent0 += l2_lambda*in_cluster_lens.mean()
     
@@ -215,7 +215,7 @@ def entropy_loss(points: torch.TensorType, max_dim: int = 2, use_prominient_feat
             prom_feats += prom_feats_ind
         else:
             prom_feats += lens.shape[0]
-        # ent += barcode_entropy(lens)
+        ent += barcode_entropy(lens)
         if (use_in_cluster_l2 and use_prominient_features):
             ent += l2_lambda*in_cluster_lens.mean()
         
