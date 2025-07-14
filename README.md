@@ -4,14 +4,15 @@
 
 ```
 project/
-├── utils/
+├── topoentropy/
 │   ├── loss_utils.py
+├── utils/
 │   └── training_utils.py
 ├──model_finetuning.ipynb
 └── README.md
 ```
 
-__The primary algorithm implementation for separation of topological features from noise__ can be found in [loss_utils.py (prominient_features)](utils/loss_utils.py#L38)
+__The primary algorithm implementation for separation of topological features from noise__ can be found in [loss_utils.py (prominient_features)](topoentropy/loss_utils.py#L38)
 
 #
 
@@ -20,7 +21,7 @@ __Entropy loss__ supports both entropy maximization of the distance distribution
 To install as a python package:
 
 ```
-pip install git+https://github.com/xenos/Shrink-the-longest.git@main
+pip install git+https://github.com/xenomirant/Shrink-the-longest.git@main
 ```
 
 #### Model finetuning scrips and visualization are located in [model_finetuning.ipynb](model_finetuning.ipynb).
