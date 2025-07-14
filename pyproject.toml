@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "topoentropy"
+version = "0.1.0"
+description = "Topological entropy loss for point clouds"
+authors = [
+    { name="Sergei Kudriashov", email="xenomirant@gmail.com" }
+]
+
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.7"
+dependencies = [
+    "torch",
+    "gudhi",
+    "torch-topological",
+    "numpy~=1.26.4",
+    "scipy~=1.13.1"
+]
+
+[project.urls]
+Homepage = "https://github.com/Xenomirant/Shrink-the-longest"

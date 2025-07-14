@@ -17,9 +17,13 @@ __The primary algorithm implementation for separation of topological features fr
 
 __Entropy loss__ supports both entropy maximization of the distance distribution on persistant features found, and an additional term for l2 minimization within clusters.
 
+To install as a python package:
+
+```
+pip install git+https://github.com/xenos/Shrink-the-longest.git@main
+```
+
 #### Model finetuning scrips and visualization are located in [model_finetuning.ipynb](model_finetuning.ipynb).
-
-
 
 
 ### Cite

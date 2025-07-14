@@ -7,11 +7,11 @@ import torch_topological.nn as ttnn
 _vr_complex = None
 
 
-def barcode_entropy(lengths):
+def barcode_entropy(lengths: torch.Tensor):
         return -torch.sum((lengths/torch.sum(lengths))*torch.log(lengths/torch.sum(lengths)))
     
 
-def prominient_features_recursive(new_lens: torch.TensorType, n_bar: int, alpha: int):
+def prominient_features_recursive(new_lens: torch.Tensor, n_bar: int, alpha: int):
 
     S = torch.sum(new_lens)
 
@@ -35,7 +35,7 @@ def prominient_features_recursive(new_lens: torch.TensorType, n_bar: int, alpha:
         return i
 
 
-def prominient_features(barcodes: torch.TensorType):
+def prominient_features(barcodes: torch.Tensor):
 
     '''
     Algorithm for prominient topological feature selection. 
@@ -61,7 +61,7 @@ def prominient_features(barcodes: torch.TensorType):
     return torch.hstack((barcodes[inds][-1], barcodes[inds][:prom_feats_ind])), barcodes[inds][prom_feats_ind:-1], prom_feats_ind
 
 
-def entropy_loss(points: torch.TensorType, max_dim: int = 2, 
+def entropy_loss(points: torch.Tensor, max_dim: int = 2, 
                  use_prominient_features=True, use_in_cluster_l2=True, l2_lambda = 0.5):
     '''
     Calculates pers. entropy maximization loss with adaptive selection of prominient features, 
@@ -117,7 +117,7 @@ def entropy_loss(points: torch.TensorType, max_dim: int = 2,
     return ent + ent0, prom_feats
 
     
-def get_persistent_pairs_cpu(points: torch.TensorType, max_dim=2):
+def get_persistent_pairs_cpu(points: torch.Tensor, max_dim=2):
     '''
     Uses Gudhi C++ backend for loss calculation
     Args:
@@ -128,14 +128,14 @@ def get_persistent_pairs_cpu(points: torch.TensorType, max_dim=2):
     ind1: List[np.array], list of higher-dimensional arrays with persistent pairs
     '''
         
-    vr = gd.RipsComplex(points=points).create_simplex_tree(max_dimension=max_dim)
-    vr.compute_persistence()
+    vr_complex = gd.RipsComplex(points=points).create_simplex_tree(max_dimension=max_dim)
+    vr_complex.compute_persistence()
     # get critical simplices
-    ind0, ind1 = vr.flag_persistence_generators()[:-2]
+    ind0, ind1 = vr_complex.flag_persistence_generators()[:-2]
 
     return ind0, ind1
 
-def get_persistent_pairs_gpu(points: torch.TensorType, max_dim=2):
+def get_persistent_pairs_gpu(points: torch.Tensor, max_dim=2):
     
     '''
     Uses torch_topological GPU accelerated backend for loss calculation
@@ -153,7 +153,7 @@ def get_persistent_pairs_gpu(points: torch.TensorType, max_dim=2):
     if _vr_complex is None:
         _vr_complex = ttnn.VietorisRipsComplex(dim=max_dim-1, return_generators=True)
     
-    ind0, *ind1 = vr(points)
+    ind0, *ind1 = _vr_complex(points)
     ind0 = ind0.pairing  # Get pairing for ind0
     ind1 = [i.pairing for i in ind1]
 
