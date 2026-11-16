@@ -117,12 +117,14 @@ def _host_pairs(points, max_dim, max_pairs, use_prominient_features):
     return tuple(out) + (np.int32(count),)
 
 
-def mst_pairs(points):
-    '''Edges (n - 1, 2) of the Euclidean minimum spanning tree, Prim's algorithm on the device.'''
-    x = jax.lax.stop_gradient(points)
-    n = x.shape[0]
-    sq = jnp.sum(x * x, axis=-1)
-    D = jnp.maximum(sq[:, None] + sq[None, :] - 2.0 * x @ x.T, 0.0)   # squared distances, same ordering
+# largest point cloud for which the minimax MST is used by default (measured crossover with Prim,
+# the compiled Prim loop is faster on CPU at every size)
+MINIMAX_MAX_POINTS = {"cpu": 0, "gpu": 512}
+
+
+def _mst_prim(D):
+    '''Prim's algorithm: n - 1 sequential steps of O(n) work.'''
+    n = D.shape[0]
 
     def step(t, state):
         in_tree, best, parent, edges = state
@@ -136,6 +138,40 @@ def mst_pairs(points):
     return jax.lax.fori_loop(0, n - 1, step, init)[3]
 
 
+def _mst_minimax(D):
+    '''
+    MST through the minimax (bottleneck) path matrix, see `loss_utils._mst_minimax`:
+    ceil(log2(n - 1)) squarings in the (min, max) semiring on the ranks of the weights.
+    '''
+    n = D.shape[0]
+    iu = np.triu_indices(n, 1)
+    order = jnp.argsort(D[iu], stable=True)
+    rank = jnp.zeros(order.shape[0], jnp.int32).at[order].set(jnp.arange(1, order.shape[0] + 1, dtype=jnp.int32))
+    R = jnp.zeros((n, n), jnp.int32).at[iu].set(rank)
+    R = R + R.T
+    M = R
+    for _ in range(max(1, int(np.ceil(np.log2(max(n - 1, 2)))))):
+        M = jnp.min(jnp.maximum(M[:, :, None], M[None, :, :]), axis=1)
+    a, b = jnp.nonzero(jnp.triu(R == M, 1), size=n - 1)
+    return jnp.stack((a, b), axis=1).astype(jnp.int32)
+
+
+def mst_pairs(points, method: str = "auto"):
+    '''
+    Edges (n - 1, 2) of the Euclidean minimum spanning tree, computed on the device.
+    method: "minimax" (log n large parallel steps, O(n^3) work), "prim" (n small sequential
+    steps, O(n^2) work) or "auto" (minimax up to MINIMAX_MAX_POINTS points for the backend, prim above)
+    '''
+    x = jax.lax.stop_gradient(points)
+    n = x.shape[0]
+    if method == "auto":
+        limit = MINIMAX_MAX_POINTS["cpu" if jax.default_backend() == "cpu" else "gpu"]
+        method = "minimax" if n <= limit else "prim"
+    sq = jnp.sum(x * x, axis=-1)
+    D = jnp.maximum(sq[:, None] + sq[None, :] - 2.0 * x @ x.T, 0.0)   # squared distances, same ordering
+    return _mst_minimax(D) if method == "minimax" else _mst_prim(D)
+
+
 def _xlogx(x):
     return x * jnp.log(x)
 
@@ -143,7 +179,8 @@ def _xlogx(x):
 def prominient_masks(lens, valid):
     '''
     Vectorized selection of prominient features (see `loss_utils.prominient_count`) for a
-    fixed-size array of bars with a validity mask.
+    fixed-size array of bars with a validity mask: an (N, N) table of cut points followed
+    by log N pointer-jumping steps.
     Returns (prominient mask, in-cluster mask, reported number of features).
     '''
     N = lens.shape[0]
@@ -157,26 +194,23 @@ def prominient_masks(lens, valid):
     alpha = small / large
     safe_alpha = jnp.where((alpha > 0) & (alpha < 1), alpha, 0.5)
 
-    def cut(m):
-        ok = k < m
-        x = jnp.where(ok, prefix, 0.0)
-        xl = jnp.where(ok, _xlogx(jnp.where(ok, prefix, 1.0)), 0.0)
-        T = jnp.cumsum(x[::-1])[::-1] + small + large
-        E = jnp.cumsum(xl[::-1])[::-1] + _xlogx(jnp.where(small > 0, small, 1.0)) + _xlogx(jnp.where(large > 0, large, 1.0))
-        S = T + k * jnp.exp(E / jnp.where(T > 0, T, 1.0))
-        stop = (S[:-1] < S[1:]) & (k[1:] <= m - 1)
-        i = jnp.where(jnp.any(stop), jnp.argmax(stop) + 1, m - 1).astype(jnp.int32)
-        Q = jnp.ceil(safe_alpha * (m + 2) * (safe_alpha - 1 - jnp.log(safe_alpha)) / (safe_alpha - 1) ** 2)
-        again = (Q < i) & (alpha > 0) & (alpha < 1)
-        return i, again
-
-    def body(state):
-        m, _, _ = state
-        i, again = cut(m)
-        return jnp.where(again, i, m), i, again
-
-    m0 = jnp.maximum(v - 2, 1)
-    _, i, _ = jax.lax.while_loop(lambda s: s[2], body, (m0, m0, jnp.array(True)))
+    P = N - 1
+    m = jnp.arange(P + 1, dtype=jnp.int32)                    # row m: the barcode (prefix[:m], small, large)
+    ok = k[None, :] < m[:, None]
+    x = jnp.where(ok, prefix[None, :], 0.0)
+    xl = jnp.where(ok, _xlogx(jnp.where(prefix > 0, prefix, 1.0))[None, :], 0.0)
+    T = jnp.cumsum(x[:, ::-1], axis=1)[:, ::-1] + small + large
+    E = jnp.cumsum(xl[:, ::-1], axis=1)[:, ::-1] + _xlogx(jnp.where(small > 0, small, 1.0)) \
+        + _xlogx(jnp.where(large > 0, large, 1.0))
+    S = T + k[None, :] * jnp.exp(E / jnp.where(T > 0, T, 1.0))
+    stop = (S[:, :-1] < S[:, 1:]) & (k[None, 1:] <= m[:, None] - 1)
+    cut = jnp.maximum(jnp.where(jnp.any(stop, axis=1), jnp.argmax(stop, axis=1) + 1, m - 1), 0).astype(jnp.int32)
+    Q = jnp.ceil(safe_alpha * (m + 2) * (safe_alpha - 1 - jnp.log(safe_alpha)) / (safe_alpha - 1) ** 2)
+    restart = (Q < cut) & (alpha > 0) & (alpha < 1)
+    nxt = jnp.where(restart, cut, m)
+    for _ in range(max(1, int(np.ceil(np.log2(P + 1))))):
+        nxt = nxt[nxt]
+    i = cut[nxt[jnp.clip(v - 2, 0, P)]]
 
     few = v <= 3
     n_prom = jnp.where(few, v, i + 1)

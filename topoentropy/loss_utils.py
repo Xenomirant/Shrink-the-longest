@@ -2,6 +2,9 @@ import math
 
 import torch
 
+# largest point cloud for which the minimax MST is used by default (measured crossover with Prim)
+MINIMAX_MAX_POINTS = {"cpu": 128, "gpu": 1024}
+
 
 def barcode_entropy(lengths: torch.Tensor):
         return -torch.sum((lengths/torch.sum(lengths))*torch.log(lengths/torch.sum(lengths)))
@@ -13,9 +16,11 @@ def prominient_count(desc: torch.Tensor) -> int:
     Nieves Atienza, Rocio Gonzalez-Diaz, & Matteo Rucco. (2017).
     Persistent Entropy for Separating Topological Features from Noise in Vietoris-Rips Complexes.
 
-    Vectorized form of the original sequential rule: for a fixed number of bars all candidate
-    cut points i are evaluated at once on the device, so the loop only runs over the
-    (few) recursive reductions of the barcode.
+    Vectorized form of the original sequential rule. The rule repeatedly cuts the barcode
+    (prefix[:m], small, large) at some i < m and restarts with m = i. Here the cut point is
+    computed for every m at once as an (n, n) table, and the chain of restarts is followed
+    with log n pointer-jumping steps, so the whole selection is a fixed number of large
+    operations on the device.
 
     Args:
     desc: torch.tensor, 1-dimensional tensor of n > 3 bar lengths sorted in descending order
@@ -24,29 +29,30 @@ def prominient_count(desc: torch.Tensor) -> int:
     '''
     n = desc.shape[0]
     large, small = desc[0], desc[-1]
-    prefix = desc[1:-1]                      # the barcode is (prefix[:m], small, large)
-    alpha = small / large
-    k = torch.arange(prefix.shape[0], device=desc.device)
+    prefix = desc[1:-1]
+    P = prefix.shape[0]                                   # n - 2
+    k = torch.arange(P, device=desc.device)
+    m = torch.arange(P + 1, device=desc.device)           # row m: the barcode (prefix[:m], small, large)
     xlogx = lambda x: x * torch.log(x)
-    m = n - 2
-    while True:
-        n_bar = m + 2
-        valid = k < m
-        x = torch.where(valid, prefix, torch.zeros_like(prefix))
-        xl = torch.where(valid, xlogx(torch.where(valid, prefix, torch.ones_like(prefix))), torch.zeros_like(prefix))
-        # sums over tails (prefix[i:m], small, large) for every i
-        T = torch.flip(torch.cumsum(torch.flip(x, [0]), 0), [0]) + small + large
-        E = torch.flip(torch.cumsum(torch.flip(xl, [0]), 0), [0]) + xlogx(small) + xlogx(large)
-        # S_i = T_i + i * T_i / exp(H_i), and T_i / exp(H_i) = exp(E_i / T_i)
-        S = T + k * torch.exp(E / T)
-        stop = (S[:-1] < S[1:]) & (k[1:] <= m - 1)
-        i = int(torch.argmax(stop.to(torch.int8))) + 1 if bool(stop.any()) else m - 1
-        a = float(alpha)
-        Q = math.ceil(a * n_bar * (a - 1 - math.log(a)) / (a - 1) ** 2) if 0 < a < 1 else math.nan
-        if Q < i:
-            m = i
-            continue
-        return i
+
+    valid = k[None, :] < m[:, None]
+    x = torch.where(valid, prefix[None, :], torch.zeros_like(prefix)[None, :])
+    xl = torch.where(valid, xlogx(prefix)[None, :], torch.zeros_like(prefix)[None, :])
+    # sums over tails (prefix[i:m], small, large) for every m and i
+    T = torch.flip(torch.cumsum(torch.flip(x, [1]), 1), [1]) + small + large
+    E = torch.flip(torch.cumsum(torch.flip(xl, [1]), 1), [1]) + xlogx(small) + xlogx(large)
+    # S_i = T_i + i * T_i / exp(H_i), and T_i / exp(H_i) = exp(E_i / T_i)
+    S = T + k[None, :] * torch.exp(E / T)
+    stop = (S[:, :-1] < S[:, 1:]) & (k[None, 1:] <= m[:, None] - 1)
+    cut = torch.where(stop.any(dim=1), torch.argmax(stop.to(torch.int8), dim=1) + 1, m - 1).clamp(min=0)
+
+    alpha = small / large
+    Q = torch.ceil(alpha * (m + 2) * (alpha - 1 - torch.log(alpha)) / (alpha - 1) ** 2)
+    restart = Q < cut                                     # False for nan (alpha = 1)
+    nxt = torch.where(restart, cut, m)
+    for _ in range(max(1, math.ceil(math.log2(P + 1)))):
+        nxt = nxt[nxt]
+    return int(cut[nxt[P]])
 
 
 def prominient_features(barcodes: torch.Tensor):
@@ -73,31 +79,78 @@ def prominient_features(barcodes: torch.Tensor):
     return desc[:k + 1], desc[k + 1:], k
 
 
-def mst_pairs(points: torch.Tensor):
+def _mst_prim(D: torch.Tensor):
+    '''Prim's algorithm: n - 1 sequential steps of O(n) work. Returns (child, parent) index tensors.'''
+    n = D.shape[0]
+    in_tree = torch.zeros(n, dtype=torch.bool, device=D.device)
+    in_tree[0] = True
+    best = D[0].clone()
+    parent = torch.zeros(n, dtype=torch.long, device=D.device)
+    child = torch.empty(n - 1, dtype=torch.long, device=D.device)
+    par = torch.empty(n - 1, dtype=torch.long, device=D.device)
+    inf = torch.tensor(float("inf"), dtype=D.dtype, device=D.device)
+    for t in range(n - 1):
+        j = torch.argmin(torch.where(in_tree, inf, best))
+        child[t], par[t] = j, parent[j]
+        in_tree[j] = True
+        upd = D[j] < best
+        best = torch.where(upd, D[j], best)
+        parent = torch.where(upd, j, parent)
+    return child, par
+
+
+def _mst_minimax(D: torch.Tensor, max_elements: int = 2 ** 26):
+    '''
+    MST through the minimax (bottleneck) path matrix. An edge belongs to the MST iff its weight
+    equals the minimax distance between its ends. The minimax matrix is the closure of the weight
+    matrix under the (min, max) matrix product, obtained with ceil(log2(n - 1)) squarings, each
+    of which is one large parallel operation. Weights are replaced by their ranks, so ties are
+    broken consistently and exactly n - 1 edges are returned.
+    '''
+    n = D.shape[0]
+    iu = torch.triu_indices(n, n, offset=1, device=D.device)
+    order = torch.argsort(D[iu[0], iu[1]], stable=True)
+    rank = torch.empty_like(order, dtype=torch.int32)
+    rank[order] = torch.arange(1, order.numel() + 1, dtype=torch.int32, device=D.device)
+    R = torch.zeros((n, n), dtype=torch.int32, device=D.device)
+    R[iu[0], iu[1]] = rank
+    R = R + R.T
+    M = R
+    rows = max(1, max_elements // (n * n))
+    for _ in range(max(1, math.ceil(math.log2(max(n - 1, 2))))):
+        if rows >= n:
+            M = torch.maximum(M[:, :, None], M[None, :, :]).amin(dim=1)
+        else:
+            M = torch.cat([torch.maximum(M[r:r + rows, :, None], M[None, :, :]).amin(dim=1)
+                           for r in range(0, n, rows)])
+    edges = torch.nonzero(torch.triu(R == M, diagonal=1))
+    return edges[:, 0], edges[:, 1]
+
+
+def mst_pairs(points: torch.Tensor, method: str = "auto"):
     '''
     Zero-dimensional persistence pairs of the Vietoris-Rips filtration, i.e. the edges of the
-    Euclidean minimum spanning tree, computed with Prim's algorithm on the device of `points`
+    Euclidean minimum spanning tree, computed on the device of `points`
     (runs on GPU for CUDA / MPS tensors).
+
+    method: "minimax" (log n large parallel steps, O(n^3) work), "prim" (n small sequential
+    steps, O(n^2) work) or "auto" (minimax up to MINIMAX_MAX_POINTS points for the device, prim above)
 
     Returns ind0: torch.tensor of shape (n - 1, 3) in Gudhi's layout (vertex, edge end, edge end)
     '''
     n = points.shape[0]
+    if method == "auto":
+        limit = MINIMAX_MAX_POINTS["gpu" if points.device.type == "cuda" else "cpu"]
+        method = "minimax" if n <= limit else "prim"
     with torch.no_grad():
         D = torch.cdist(points, points, compute_mode="donot_use_mm_for_euclid_dist")
-        in_tree = torch.zeros(n, dtype=torch.bool, device=points.device)
-        in_tree[0] = True
-        best = D[0].clone()
-        parent = torch.zeros(n, dtype=torch.long, device=points.device)
-        child = torch.empty(n - 1, dtype=torch.long, device=points.device)
-        par = torch.empty(n - 1, dtype=torch.long, device=points.device)
-        inf = torch.tensor(float("inf"), dtype=D.dtype, device=points.device)
-        for t in range(n - 1):
-            j = torch.argmin(torch.where(in_tree, inf, best))
-            child[t], par[t] = j, parent[j]
-            in_tree[j] = True
-            upd = D[j] < best
-            best = torch.where(upd, D[j], best)
-            parent = torch.where(upd, j, parent)
+        if method == "minimax":
+            child, par = _mst_minimax(D)
+        elif points.device.type == "mps":
+            # many tiny sequential steps are slow on MPS: run them on CPU, only indices travel back
+            child, par = (i.to(points.device) for i in _mst_prim(D.cpu()))
+        else:
+            child, par = _mst_prim(D)
     return torch.stack((child, par, child), dim=1)
 
 
