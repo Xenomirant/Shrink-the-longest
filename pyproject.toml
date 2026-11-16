@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "topoentropy"
-version = "0.1.0"
+version = "0.2.0"
 description = "Topological entropy loss for point clouds"
 authors = [
     { name="Sergei Kudriashov", email="xenomirant@gmail.com" }
@@ -12,14 +12,19 @@ authors = [
 
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.7"
-dependencies = [
-    "torch",
-    "gudhi",
-    "torch-topological",
-    "numpy~=1.26.4",
-    "scipy~=1.13.1"
-]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+# the two implementations are independent, install one of them
+torch = ["torch>=2.5"]
+jax = ["jax>=0.5", "numpy>=2.0"]
+# persistence above H0 (max_dim > 1) is computed with Gudhi on the host
+higher = ["gudhi>=3.10", "numpy>=2.0"]
+test = ["pytest", "gudhi>=3.10", "numpy>=2.0"]
+
+[tool.setuptools]
+packages = ["topoentropy"]
 
 [project.urls]
 Homepage = "https://github.com/Xenomirant/Shrink-the-longest"

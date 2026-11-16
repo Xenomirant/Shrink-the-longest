@@ -1,16 +1,15 @@
 from collections import deque
 import typing
-import scipy
 import numpy as np
 import torch
-from matplotlib import pyplot as plt
-import ripser
 
 
 def intrinsic_dimension(emb, debug=False, reduction_factor=5,):
     """
     emb: n x dim torch tensor
     """
+    if debug:
+        from matplotlib import pyplot as plt
     with torch.no_grad():
         eps = 1e-8
         embeddings = emb.to(torch.float64)
@@ -77,18 +76,17 @@ def calculate_ph_dim(W, min_points=150, max_points=800, point_jump=50,
         h_dim=0, print_error=False):
     
     
+    import gudhi as gd
+
     # sample our points
     test_n = range(min_points, max_points, point_jump)
     lengths = []
     for n in test_n:
-        diagrams = ripser(sample_W(W, n))['dgms']
-        
-        if len(diagrams) > h_dim:
-            d = diagrams[h_dim]
-            d = d[d[:, 1] < np.inf]
-            lengths.append((d[:, 1] - d[:, 0]).sum())
-        else:
-            lengths.append(0.0)
+        st = gd.RipsComplex(points=sample_W(W, n)).create_simplex_tree(max_dimension=h_dim + 1)
+        st.compute_persistence()
+        d = st.persistence_intervals_in_dimension(h_dim)
+        d = d[d[:, 1] < np.inf] if len(d) else np.zeros((0, 2))
+        lengths.append((d[:, 1] - d[:, 0]).sum())
     lengths = np.array(lengths)
     
     # compute our ph dim by running a linear least squares
@@ -112,7 +110,7 @@ def compute_anisotropy(matrix, n_components: typing.Union[str, int] = 3, write_t
     matrix -- array for computation
     write_to_file -- whether to write to the specified filename; if not, returns as output
     '''
-    res = scipy.linalg.svd(matrix, overwrite_a = True, full_matrices = False, compute_uv=False)
+    res = np.linalg.svd(np.asarray(matrix), compute_uv=False)
     if n_components == "all":
         anisotropy = res
     else:

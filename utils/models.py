@@ -38,8 +38,8 @@ class BertForSequenceClassification(PreTrainedModel):
         return None
 
     __cont_embedding_factory = {"CLS": lambda x, _: x.hidden_states[-1][:, 0, :],
-                          "AVG": lambda x, attention_mask: SpecialBertForSequenceClassification.mean_pooling(x.hidden_states[-1], attention_mask),
-                          "MUL_AVG": lambda x, attention_mask: SpecialBertForSequenceClassification.first_last_pooling(x, attention_mask)}
+                          "AVG": lambda x, attention_mask: BertForSequenceClassification.mean_pooling(x.hidden_states[-1], attention_mask),
+                          "MUL_AVG": lambda x, attention_mask: BertForSequenceClassification.first_last_pooling(x, attention_mask)}
 
     def forward(
         self,
