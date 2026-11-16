@@ -72,3 +72,4 @@ CONFIGS = [
     dict(max_dim=2, use_in_cluster_l2=False),
     dict(max_dim=3),
 ]
+

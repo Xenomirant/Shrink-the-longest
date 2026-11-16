@@ -3,7 +3,7 @@ import math
 import torch
 
 # largest point cloud for which the minimax MST is used by default (measured crossover with Prim)
-MINIMAX_MAX_POINTS = {"cpu": 128, "gpu": 1024}
+MINIMAX_MAX_POINTS = {"cpu": 128, "gpu": 512}
 
 
 def barcode_entropy(lengths: torch.Tensor):
@@ -106,25 +106,56 @@ def _mst_minimax(D: torch.Tensor, max_elements: int = 2 ** 26):
     matrix under the (min, max) matrix product, obtained with ceil(log2(n - 1)) squarings, each
     of which is one large parallel operation. Weights are replaced by their ranks, so ties are
     broken consistently and exactly n - 1 edges are returned.
+
+    D: (n, n) or a batch (B, n, n) of symmetric weight matrices.
+    Returns (child, parent) index tensors of shape (n - 1,) or (B, n - 1).
     '''
-    n = D.shape[0]
+    batched = D.dim() == 3
+    D = D if batched else D[None]
+    B, n = D.shape[0], D.shape[-1]
     iu = torch.triu_indices(n, n, offset=1, device=D.device)
-    order = torch.argsort(D[iu[0], iu[1]], stable=True)
+    order = torch.argsort(D[:, iu[0], iu[1]], dim=1, stable=True)
     rank = torch.empty_like(order, dtype=torch.int32)
-    rank[order] = torch.arange(1, order.numel() + 1, dtype=torch.int32, device=D.device)
-    R = torch.zeros((n, n), dtype=torch.int32, device=D.device)
-    R[iu[0], iu[1]] = rank
-    R = R + R.T
+    rank.scatter_(1, order, torch.arange(1, order.shape[1] + 1, dtype=torch.int32, device=D.device).expand(B, -1))
+    R = torch.zeros((B, n, n), dtype=torch.int32, device=D.device)
+    R[:, iu[0], iu[1]] = rank
+    R = R + R.transpose(1, 2)
     M = R
-    rows = max(1, max_elements // (n * n))
+    rows = max(1, max_elements // (B * n * n))
     for _ in range(max(1, math.ceil(math.log2(max(n - 1, 2))))):
         if rows >= n:
-            M = torch.maximum(M[:, :, None], M[None, :, :]).amin(dim=1)
+            M = torch.maximum(M[:, :, :, None], M[:, None, :, :]).amin(dim=2)
         else:
-            M = torch.cat([torch.maximum(M[r:r + rows, :, None], M[None, :, :]).amin(dim=1)
-                           for r in range(0, n, rows)])
-    edges = torch.nonzero(torch.triu(R == M, diagonal=1))
-    return edges[:, 0], edges[:, 1]
+            M = torch.cat([torch.maximum(M[:, r:r + rows, :, None], M[:, None, :, :]).amin(dim=2)
+                           for r in range(0, n, rows)], dim=1)
+    edges = torch.nonzero(torch.triu(R == M, diagonal=1))        # sorted by batch, n - 1 rows each
+    a, b = edges[:, 1].reshape(B, n - 1), edges[:, 2].reshape(B, n - 1)
+    return (a, b) if batched else (a[0], b[0])
+
+
+def mst_edges(D: torch.Tensor, method: str = "auto"):
+    '''
+    Edges of the minimum spanning tree of a complete weighted graph, computed on the device of `D`.
+
+    D: (n, n) or a batch (B, n, n) of symmetric weight matrices (gradients are not needed here)
+    method: "minimax", "prim" or "auto", see `mst_pairs`
+
+    Returns a long tensor of shape (n - 1, 2) or (B, n - 1, 2)
+    '''
+    D = D.detach()
+    n = D.shape[-1]
+    if method == "auto":
+        limit = MINIMAX_MAX_POINTS["gpu" if D.device.type == "cuda" else "cpu"]
+        method = "minimax" if n <= limit else "prim"
+    if method == "minimax":
+        a, b = _mst_minimax(D)
+        return torch.stack((a, b), dim=-1)
+
+    def prim(d):
+        # many tiny sequential steps are slow on accelerators: run them on CPU, only indices travel back
+        return torch.stack([i.to(d.device) for i in _mst_prim(d.cpu())], dim=-1)
+
+    return prim(D) if D.dim() == 2 else torch.stack([prim(d) for d in D])
 
 
 def mst_pairs(points: torch.Tensor, method: str = "auto"):
@@ -138,20 +169,10 @@ def mst_pairs(points: torch.Tensor, method: str = "auto"):
 
     Returns ind0: torch.tensor of shape (n - 1, 3) in Gudhi's layout (vertex, edge end, edge end)
     '''
-    n = points.shape[0]
-    if method == "auto":
-        limit = MINIMAX_MAX_POINTS["gpu" if points.device.type == "cuda" else "cpu"]
-        method = "minimax" if n <= limit else "prim"
     with torch.no_grad():
         D = torch.cdist(points, points, compute_mode="donot_use_mm_for_euclid_dist")
-        if method == "minimax":
-            child, par = _mst_minimax(D)
-        elif points.device.type == "mps":
-            # many tiny sequential steps are slow on MPS: run them on CPU, only indices travel back
-            child, par = (i.to(points.device) for i in _mst_prim(D.cpu()))
-        else:
-            child, par = _mst_prim(D)
-    return torch.stack((child, par, child), dim=1)
+    e = mst_edges(D, method=method)
+    return torch.stack((e[:, 0], e[:, 1], e[:, 0]), dim=1)
 
 
 def get_persistent_pairs(points: torch.Tensor, max_dim=2):

@@ -23,3 +23,4 @@ def test_jax_matches_torch(kw, seed):
     assert ka == int(kb)
     np.testing.assert_allclose(float(a.detach()), float(b), rtol=1e-6)
     np.testing.assert_allclose(pts.grad.numpy(), np.asarray(gb), rtol=1e-5, atol=1e-8)
+

@@ -156,20 +156,25 @@ def _mst_minimax(D):
     return jnp.stack((a, b), axis=1).astype(jnp.int32)
 
 
-def mst_pairs(points, method: str = "auto"):
+def mst_edges(D, method: str = "auto"):
     '''
-    Edges (n - 1, 2) of the Euclidean minimum spanning tree, computed on the device.
+    Edges (n - 1, 2) of the minimum spanning tree of a complete graph with symmetric weights D (n, n).
     method: "minimax" (log n large parallel steps, O(n^3) work), "prim" (n small sequential
     steps, O(n^2) work) or "auto" (minimax up to MINIMAX_MAX_POINTS points for the backend, prim above)
     '''
-    x = jax.lax.stop_gradient(points)
-    n = x.shape[0]
+    D = jax.lax.stop_gradient(D)
     if method == "auto":
         limit = MINIMAX_MAX_POINTS["cpu" if jax.default_backend() == "cpu" else "gpu"]
-        method = "minimax" if n <= limit else "prim"
+        method = "minimax" if D.shape[0] <= limit else "prim"
+    return _mst_minimax(D) if method == "minimax" else _mst_prim(D)
+
+
+def mst_pairs(points, method: str = "auto"):
+    '''Edges (n - 1, 2) of the Euclidean minimum spanning tree, computed on the device, see `mst_edges`.'''
+    x = jax.lax.stop_gradient(points)
     sq = jnp.sum(x * x, axis=-1)
     D = jnp.maximum(sq[:, None] + sq[None, :] - 2.0 * x @ x.T, 0.0)   # squared distances, same ordering
-    return _mst_minimax(D) if method == "minimax" else _mst_prim(D)
+    return mst_edges(D, method)
 
 
 def _xlogx(x):
